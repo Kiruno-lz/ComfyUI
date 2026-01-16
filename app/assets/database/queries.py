@@ -1,9 +1,11 @@
+import os
 import sqlalchemy as sa
 from collections import defaultdict
+from datetime import datetime
 from sqlalchemy import select, exists, func
 from sqlalchemy.orm import Session, contains_eager, noload
 from app.assets.database.models import Asset, AssetInfo, AssetCacheState, AssetInfoMeta, AssetInfoTag, Tag
-from app.assets.helpers import escape_like_prefix, normalize_tags
+from app.assets.helpers import escape_like_prefix, normalize_tags, utcnow
 from typing import Sequence
 
 
@@ -41,6 +43,7 @@ def apply_tag_filters(
             )
         )
     return stmt
+
 
 def apply_metadata_filter(
     stmt: sa.sql.Select,
@@ -105,8 +108,10 @@ def asset_exists_by_hash(session: Session, asset_hash: str) -> bool:
     ).first()
     return row is not None
 
+
 def get_asset_info_by_id(session: Session, asset_info_id: str) -> AssetInfo | None:
     return session.get(AssetInfo, asset_info_id)
+
 
 def list_asset_infos_page(
     session: Session,
@@ -177,6 +182,7 @@ def list_asset_infos_page(
 
     return infos, tag_map, total
 
+
 def fetch_asset_info_asset_and_tags(
     session: Session,
     asset_info_id: str,
@@ -207,6 +213,7 @@ def fetch_asset_info_asset_and_tags(
             seen.add(tag_name)
             tags.append(tag_name)
     return first_info, first_asset, tags
+
 
 def fetch_asset_info_and_asset(
     session: Session,
@@ -240,6 +247,23 @@ def list_cache_states_by_asset_id(
             .order_by(AssetCacheState.id.asc())
         )
     ).scalars().all()
+
+
+def touch_asset_info_by_id(
+    session: Session,
+    *,
+    asset_info_id: str,
+    ts: datetime | None = None,
+    only_if_newer: bool = True,
+) -> None:
+    ts = ts or utcnow()
+    stmt = sa.update(AssetInfo).where(AssetInfo.id == asset_info_id)
+    if only_if_newer:
+        stmt = stmt.where(
+            sa.or_(AssetInfo.last_access_time.is_(None), AssetInfo.last_access_time < ts)
+        )
+    session.execute(stmt.values(last_access_time=ts))
+
 
 def list_tags_with_usage(
     session: Session,
@@ -298,3 +322,19 @@ def list_tags_with_usage(
 
     rows_norm = [(name, ttype, int(count or 0)) for (name, ttype, count) in rows]
     return rows_norm, int(total or 0)
+
+
+def pick_best_live_path(states: Sequence[AssetCacheState]) -> str:
+    """
+    Return the best on-disk path among cache states:
+      1) Prefer a path that exists with needs_verify == False (already verified).
+      2) Otherwise, pick the first path that exists.
+      3) Otherwise return empty string.
+    """
+    alive = [s for s in states if getattr(s, "file_path", None) and os.path.isfile(s.file_path)]
+    if not alive:
+        return ""
+    for s in alive:
+        if not getattr(s, "needs_verify", False):
+            return s.file_path
+    return alive[0].file_path

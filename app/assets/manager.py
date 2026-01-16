@@ -11,6 +11,7 @@ from app.assets.database.queries import (
     list_cache_states_by_asset_id,
     list_asset_infos_page,
     list_tags_with_usage,
+    pick_best_live_path,
 )
 
 
