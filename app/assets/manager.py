@@ -20,6 +20,7 @@ from app.assets.database.queries import (
     get_asset_tags,
     pick_best_live_path,
     ingest_fs_asset,
+    set_asset_info_preview,
 )
 from app.assets.helpers import resolve_destination_from_tags, ensure_within_base
 
@@ -315,6 +316,45 @@ def update_asset(
         tags=tag_names,
         user_metadata=info.user_metadata or {},
         updated_at=info.updated_at,
+    )
+
+
+def set_asset_preview(
+    *,
+    asset_info_id: str,
+    preview_asset_id: str | None = None,
+    owner_id: str = "",
+) -> schemas_out.AssetDetail:
+    with create_session() as session:
+        info_row = get_asset_info_by_id(session, asset_info_id=asset_info_id)
+        if not info_row:
+            raise ValueError(f"AssetInfo {asset_info_id} not found")
+        if info_row.owner_id and info_row.owner_id != owner_id:
+            raise PermissionError("not owner")
+
+        set_asset_info_preview(
+            session,
+            asset_info_id=asset_info_id,
+            preview_asset_id=preview_asset_id,
+        )
+
+        res = fetch_asset_info_asset_and_tags(session, asset_info_id=asset_info_id, owner_id=owner_id)
+        if not res:
+            raise RuntimeError("State changed during preview update")
+        info, asset, tags = res
+        session.commit()
+
+    return schemas_out.AssetDetail(
+        id=info.id,
+        name=info.name,
+        asset_hash=asset.hash if asset else None,
+        size=int(asset.size_bytes) if asset and asset.size_bytes is not None else None,
+        mime_type=asset.mime_type if asset else None,
+        tags=tags,
+        user_metadata=info.user_metadata or {},
+        preview_id=info.preview_id,
+        created_at=info.created_at,
+        last_access_time=info.last_access_time,
     )
 
 

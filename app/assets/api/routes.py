@@ -380,3 +380,29 @@ async def update_asset(request: web.Request) -> web.Response:
         return _error_response(500, "INTERNAL", "Unexpected server error.")
     return web.json_response(result.model_dump(mode="json"), status=200)
 
+@ROUTES.put(f"/api/assets/{{id:{UUID_RE}}}/preview")
+async def set_asset_preview(request: web.Request) -> web.Response:
+    asset_info_id = str(uuid.UUID(request.match_info["id"]))
+    try:
+        body = schemas_in.SetPreviewBody.model_validate(await request.json())
+    except ValidationError as ve:
+        return _validation_error_response("INVALID_BODY", ve)
+    except Exception:
+        return _error_response(400, "INVALID_JSON", "Request body must be valid JSON.")
+
+    try:
+        result = manager.set_asset_preview(
+            asset_info_id=asset_info_id,
+            preview_asset_id=body.preview_id,
+            owner_id=USER_MANAGER.get_request_user_id(request),
+        )
+    except (PermissionError, ValueError) as ve:
+        return _error_response(404, "ASSET_NOT_FOUND", str(ve), {"id": asset_info_id})
+    except Exception:
+        logging.exception(
+            "set_asset_preview failed for asset_info_id=%s, owner_id=%s",
+            asset_info_id,
+            USER_MANAGER.get_request_user_id(request),
+        )
+        return _error_response(500, "INTERNAL", "Unexpected server error.")
+    return web.json_response(result.model_dump(mode="json"), status=200)
