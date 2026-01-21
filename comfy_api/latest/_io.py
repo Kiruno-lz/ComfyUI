@@ -1346,6 +1346,8 @@ class Schema:
     hidden: list[Hidden] = field(default_factory=list)
     description: str=""
     """Node description, shown as a tooltip when hovering over the node."""
+    search_aliases: list[str] = field(default_factory=list)
+    """Alternative names for search. Useful for synonyms, abbreviations, or old names after renaming."""
     is_input_list: bool = False
     """A flag indicating if this node implements the additional code necessary to deal with OUTPUT_IS_LIST nodes.
 
