@@ -19,11 +19,13 @@ class NodeReplace:
     def __init__(self,
         new_node_id: str,
         old_node_id: str,
+        old_widget_ids: list[str] | None=None,
         input_mapping: list[InputMap] | None=None,
         output_mapping: list[OutputMap] | None=None,
     ):
         self.new_node_id = new_node_id
         self.old_node_id = old_node_id
+        self.old_widget_ids = old_widget_ids
         self.input_mapping = input_mapping
         self.output_mapping = output_mapping
 
@@ -34,6 +36,7 @@ class NodeReplace:
         return {
             "new_node_id": self.new_node_id,
             "old_node_id": self.old_node_id,
+            "old_widget_ids": self.old_widget_ids,
             "input_mapping": [m.as_dict() for m in self.input_mapping] if self.input_mapping else None,
             "output_mapping": [m.as_dict() for m in self.output_mapping] if self.output_mapping else None,
         }
