@@ -121,9 +121,8 @@ class CacheProvider(ABC):
         Called before on_lookup (value=None) and on_store (value provided).
         Return False to skip external caching for this node.
 
-        Common filters:
-            - By class_type: Only cache expensive nodes (KSampler, VAEDecode)
-            - By cost/benefit: Skip if download time > compute time
+        Implementations can filter based on context.class_type, value size,
+        or any custom logic. Use estimate_value_size() to get value size.
 
         Default: Returns True (cache everything).
         """
