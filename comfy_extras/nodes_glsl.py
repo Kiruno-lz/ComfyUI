@@ -1,5 +1,9 @@
+import os
+import sys
 import re
 import logging
+import ctypes.util
+import importlib.util
 from typing import TypedDict
 
 import numpy as np
@@ -12,23 +16,55 @@ from utils.install_util import get_missing_requirements_message
 
 logger = logging.getLogger(__name__)
 
-try:
-    import glfw
-    import OpenGL.GL as gl
-except ImportError as e:
-    raise RuntimeError(
-        f"OpenGL dependencies not available.\n{get_missing_requirements_message()}\n"
-        "Install with: pip install PyOpenGL PyOpenGL-accelerate glfw"
-    ) from e
-except AttributeError as e:
-    # This happens when PyOpenGL can't initialize (e.g., no display, missing libraries)
-    raise RuntimeError(
-        "OpenGL initialization failed.\n"
-        "Ensure OpenGL drivers are installed and a display is available.\n\n"
-        "For headless servers, you may need:\n"
-        "  - EGL: sudo apt install libegl1-mesa-dev\n"
-        "  - Or a virtual display: Xvfb :99 & export DISPLAY=:99"
-    ) from e
+
+def _check_opengl_availability():
+    """Early check for OpenGL availability. Raises RuntimeError if unlikely to work."""
+    missing = []
+
+    # Check Python packages (using find_spec to avoid importing)
+    if importlib.util.find_spec("glfw") is None:
+        missing.append("glfw")
+
+    if importlib.util.find_spec("OpenGL") is None:
+        missing.append("PyOpenGL")
+
+    if missing:
+        raise RuntimeError(
+            f"OpenGL dependencies not available.\n{get_missing_requirements_message()}\n"
+        )
+
+    # On Linux without display, check if headless backends are available
+    if sys.platform.startswith("linux"):
+        has_display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if not has_display:
+            # Check for EGL or OSMesa libraries
+            has_egl = ctypes.util.find_library("EGL")
+            has_osmesa = ctypes.util.find_library("OSMesa")
+
+            if not has_egl and not has_osmesa:
+                raise RuntimeError(
+                    "GLSL Shader node: No display and no headless backend (EGL/OSMesa) found.\n"
+                    "See error below for installation instructions."
+                )
+            logger.debug(f"Headless mode: EGL={'yes' if has_egl else 'no'}, OSMesa={'yes' if has_osmesa else 'no'}")
+
+
+# Run early check at import time
+_check_opengl_availability()
+
+# OpenGL modules - initialized lazily when context is created
+gl = None
+glfw = None
+EGL = None
+
+
+def _import_opengl():
+    """Import OpenGL module. Called after context is created."""
+    global gl
+    if gl is None:
+        import OpenGL.GL as _gl
+        gl = _gl
+    return gl
 
 
 class SizeModeInput(TypedDict):
@@ -85,8 +121,134 @@ def _convert_es_to_desktop(source: str) -> str:
     return "#version 330 core\n" + source
 
 
+def _init_glfw():
+    """Initialize GLFW. Returns (window, glfw_module). Raises RuntimeError on failure."""
+    import glfw as _glfw
+
+    if not _glfw.init():
+        raise RuntimeError("glfw.init() failed")
+
+    try:
+        _glfw.window_hint(_glfw.VISIBLE, _glfw.FALSE)
+        _glfw.window_hint(_glfw.CONTEXT_VERSION_MAJOR, 3)
+        _glfw.window_hint(_glfw.CONTEXT_VERSION_MINOR, 3)
+        _glfw.window_hint(_glfw.OPENGL_PROFILE, _glfw.OPENGL_CORE_PROFILE)
+
+        window = _glfw.create_window(64, 64, "ComfyUI GLSL", None, None)
+        if not window:
+            raise RuntimeError("glfw.create_window() failed")
+
+        _glfw.make_context_current(window)
+        return window, _glfw
+    except Exception:
+        _glfw.terminate()
+        raise
+
+
+def _init_egl():
+    """Initialize EGL for headless rendering. Returns (display, context, surface, EGL_module). Raises RuntimeError on failure."""
+    from OpenGL import EGL as _EGL
+    from OpenGL.EGL import (
+        eglGetDisplay, eglInitialize, eglChooseConfig, eglCreateContext,
+        eglMakeCurrent, eglCreatePbufferSurface, eglBindAPI,
+        eglTerminate, eglDestroyContext, eglDestroySurface,
+        EGL_DEFAULT_DISPLAY, EGL_NO_CONTEXT, EGL_NONE,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_RED_SIZE, EGL_GREEN_SIZE, EGL_BLUE_SIZE, EGL_ALPHA_SIZE, EGL_DEPTH_SIZE,
+        EGL_WIDTH, EGL_HEIGHT, EGL_OPENGL_API,
+    )
+
+    display = None
+    context = None
+    surface = None
+
+    try:
+        display = eglGetDisplay(EGL_DEFAULT_DISPLAY)
+        if display == _EGL.EGL_NO_DISPLAY:
+            raise RuntimeError("eglGetDisplay() failed")
+
+        major, minor = _EGL.EGLint(), _EGL.EGLint()
+        if not eglInitialize(display, major, minor):
+            display = None  # Not initialized, don't terminate
+            raise RuntimeError("eglInitialize() failed")
+
+        config_attribs = [
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, 0, EGL_NONE
+        ]
+        configs = (_EGL.EGLConfig * 1)()
+        num_configs = _EGL.EGLint()
+        if not eglChooseConfig(display, config_attribs, configs, 1, num_configs) or num_configs.value == 0:
+            raise RuntimeError("eglChooseConfig() failed")
+        config = configs[0]
+
+        if not eglBindAPI(EGL_OPENGL_API):
+            raise RuntimeError("eglBindAPI() failed")
+
+        context_attribs = [
+            _EGL.EGL_CONTEXT_MAJOR_VERSION, 3,
+            _EGL.EGL_CONTEXT_MINOR_VERSION, 3,
+            _EGL.EGL_CONTEXT_OPENGL_PROFILE_MASK, _EGL.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+            EGL_NONE
+        ]
+        context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs)
+        if context == EGL_NO_CONTEXT:
+            raise RuntimeError("eglCreateContext() failed")
+
+        pbuffer_attribs = [EGL_WIDTH, 64, EGL_HEIGHT, 64, EGL_NONE]
+        surface = eglCreatePbufferSurface(display, config, pbuffer_attribs)
+        if surface == _EGL.EGL_NO_SURFACE:
+            raise RuntimeError("eglCreatePbufferSurface() failed")
+
+        if not eglMakeCurrent(display, surface, surface, context):
+            raise RuntimeError("eglMakeCurrent() failed")
+
+        return display, context, surface, _EGL
+
+    except Exception:
+        # Clean up any resources on failure
+        if surface is not None:
+            eglDestroySurface(display, surface)
+        if context is not None:
+            eglDestroyContext(display, context)
+        if display is not None:
+            eglTerminate(display)
+        raise
+
+
+def _init_osmesa():
+    """Initialize OSMesa for software rendering. Returns (context, buffer). Raises RuntimeError on failure."""
+    import ctypes
+
+    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+
+    from OpenGL import GL as _gl
+    from OpenGL.osmesa import (
+        OSMesaCreateContextExt, OSMesaMakeCurrent, OSMesaDestroyContext,
+        OSMESA_RGBA,
+    )
+
+    ctx = OSMesaCreateContextExt(OSMESA_RGBA, 24, 0, 0, None)
+    if not ctx:
+        raise RuntimeError("OSMesaCreateContextExt() failed")
+
+    width, height = 64, 64
+    buffer = (ctypes.c_ubyte * (width * height * 4))()
+
+    if not OSMesaMakeCurrent(ctx, buffer, _gl.GL_UNSIGNED_BYTE, width, height):
+        OSMesaDestroyContext(ctx)
+        raise RuntimeError("OSMesaMakeCurrent() failed")
+
+    return ctx, buffer
+
+
 class GLContext:
-    """Manages OpenGL context and resources for shader execution."""
+    """Manages OpenGL context and resources for shader execution.
+
+    Tries backends in order: GLFW (desktop) → EGL (headless GPU) → OSMesa (software).
+    """
 
     _instance = None
     _initialized = False
@@ -101,27 +263,85 @@ class GLContext:
             return
         GLContext._initialized = True
 
+        global glfw, EGL
+
         import time
         start = time.perf_counter()
 
-        if not glfw.init():
-            raise RuntimeError("Failed to initialize GLFW")
+        self._backend = None
+        self._window = None
+        self._egl_display = None
+        self._egl_context = None
+        self._egl_surface = None
+        self._osmesa_ctx = None
+        self._osmesa_buffer = None
 
-        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        # Try backends in order: GLFW → EGL → OSMesa
+        errors = []
 
-        self._window = glfw.create_window(64, 64, "ComfyUI GLSL", None, None)
-        if not self._window:
-            glfw.terminate()
-            raise RuntimeError("Failed to create GLFW window")
+        try:
+            self._window, glfw = _init_glfw()
+            self._backend = "glfw"
+        except Exception as e:
+            errors.append(("GLFW", e))
 
-        glfw.make_context_current(self._window)
+        if self._backend is None:
+            try:
+                self._egl_display, self._egl_context, self._egl_surface, EGL = _init_egl()
+                self._backend = "egl"
+            except Exception as e:
+                errors.append(("EGL", e))
 
-        # Create VAO (required for core profile even if we don't use vertex attributes)
-        self._vao = gl.glGenVertexArrays(1)
-        gl.glBindVertexArray(self._vao)
+        if self._backend is None:
+            try:
+                self._osmesa_ctx, self._osmesa_buffer = _init_osmesa()
+                self._backend = "osmesa"
+            except Exception as e:
+                errors.append(("OSMesa", e))
+
+        if self._backend is None:
+            if sys.platform == "win32":
+                platform_help = (
+                    "Windows: Ensure GPU drivers are installed and display is available.\n"
+                    "         CPU-only/headless mode is not supported on Windows."
+                )
+            elif sys.platform == "darwin":
+                platform_help = (
+                    "macOS: Ensure display is available. For headless, try virtual display."
+                )
+            else:
+                platform_help = (
+                    "Linux: Install one of these backends:\n"
+                    "  Desktop:           sudo apt install libgl1-mesa-glx libglfw3\n"
+                    "  Headless with GPU: sudo apt install libegl1-mesa libgl1-mesa-dri\n"
+                    "  Headless (CPU):    sudo apt install libosmesa6"
+                )
+
+            error_details = "\n".join(f"  {name}: {err}" for name, err in errors)
+            raise RuntimeError(
+                f"Failed to create OpenGL context.\n\n"
+                f"Backend errors:\n{error_details}\n\n"
+                f"{platform_help}\n\n"
+                "Python packages: pip install PyOpenGL PyOpenGL-accelerate glfw"
+            )
+
+        # Now import OpenGL.GL (after context is current)
+        _import_opengl()
+
+        # Create VAO (required for core profile, but OSMesa may use compat profile)
+        self._vao = None
+        try:
+            vao = gl.glGenVertexArrays(1)
+            gl.glBindVertexArray(vao)
+            self._vao = vao  # Only store after successful bind
+        except Exception:
+            # OSMesa with older Mesa may not support VAOs
+            # Clean up if we created but couldn't bind
+            if vao:
+                try:
+                    gl.glDeleteVertexArrays(1, [vao])
+                except Exception:
+                    pass
 
         elapsed = (time.perf_counter() - start) * 1000
 
@@ -133,11 +353,20 @@ class GLContext:
         vendor = vendor.decode() if vendor else "Unknown"
         version = version.decode() if version else "Unknown"
 
-        logger.info(f"GLSL context initialized in {elapsed:.1f}ms - {renderer} ({vendor}), GL {version}")
+        logger.info(f"GLSL context initialized in {elapsed:.1f}ms ({self._backend}) - {renderer} ({vendor}), GL {version}")
 
     def make_current(self):
-        glfw.make_context_current(self._window)
-        gl.glBindVertexArray(self._vao)
+        if self._backend == "glfw":
+            glfw.make_context_current(self._window)
+        elif self._backend == "egl":
+            from OpenGL.EGL import eglMakeCurrent
+            eglMakeCurrent(self._egl_display, self._egl_surface, self._egl_surface, self._egl_context)
+        elif self._backend == "osmesa":
+            from OpenGL.osmesa import OSMesaMakeCurrent
+            OSMesaMakeCurrent(self._osmesa_ctx, self._osmesa_buffer, gl.GL_UNSIGNED_BYTE, 64, 64)
+
+        if self._vao is not None:
+            gl.glBindVertexArray(self._vao)
 
 
 def _compile_shader(source: str, shader_type: int) -> int:
@@ -292,14 +521,15 @@ def _render_shader_batch(
                 gl.glBindTexture(gl.GL_TEXTURE_2D, input_textures[i])
 
                 # Flip vertically for GL coordinates, ensure RGBA
-                img_flipped = np.ascontiguousarray(img[::-1, :, :])
-                if img_flipped.shape[2] == 3:
-                    img_flipped = np.ascontiguousarray(np.concatenate(
-                        [img_flipped, np.ones((*img_flipped.shape[:2], 1), dtype=np.float32)],
-                        axis=2,
-                    ))
+                h, w, c = img.shape
+                if c == 3:
+                    img_upload = np.empty((h, w, 4), dtype=np.float32)
+                    img_upload[:, :, :3] = img[::-1, :, :]
+                    img_upload[:, :, 3] = 1.0
+                else:
+                    img_upload = np.ascontiguousarray(img[::-1, :, :])
 
-                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, img_flipped.shape[1], img_flipped.shape[0], 0, gl.GL_RGBA, gl.GL_FLOAT, img_flipped)
+                gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, w, h, 0, gl.GL_RGBA, gl.GL_FLOAT, img_upload)
 
             # Render
             gl.glClearColor(0, 0, 0, 0)
@@ -307,6 +537,7 @@ def _render_shader_batch(
             gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
 
             # Read back outputs for this batch
+            # (glGetTexImage is synchronous, implicitly waits for rendering)
             batch_outputs = []
             for tex in output_textures:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
