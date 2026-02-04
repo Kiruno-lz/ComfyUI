@@ -1,6 +1,6 @@
 from typing_extensions import override
 
-from comfy_api.latest import IO, ComfyExtension, Input
+from comfy_api.latest import IO, ComfyExtension, Input, Types
 from comfy_api_nodes.apis.hunyuan3d import (
     Hunyuan3DViewImage,
     InputGenerateType,
@@ -9,6 +9,8 @@ from comfy_api_nodes.apis.hunyuan3d import (
     To3DProTaskQueryRequest,
     To3DProTaskRequest,
     To3DProTaskResultResponse,
+    To3DUVFileInput,
+    To3DUVTaskRequest,
 )
 from comfy_api_nodes.util import (
     ApiEndpoint,
@@ -16,16 +18,21 @@ from comfy_api_nodes.util import (
     downscale_image_tensor_by_max_side,
     poll_op,
     sync_op,
+    upload_file_to_comfyapi,
     upload_image_to_comfyapi,
     validate_image_dimensions,
     validate_string,
 )
 
 
-def get_file_from_response(response_objs: list[ResultFile3D], file_type: str) -> ResultFile3D | None:
+def get_file_from_response(
+    response_objs: list[ResultFile3D], file_type: str, raise_if_not_found: bool = True
+) -> ResultFile3D | None:
     for i in response_objs:
         if i.Type.lower() == file_type.lower():
             return i
+    if raise_if_not_found:
+        raise ValueError(f"'{file_type}' file type is not found in the response.")
     return None
 
 
@@ -131,11 +138,14 @@ class TencentTextToModelNode(IO.ComfyNode):
             response_model=To3DProTaskResultResponse,
             status_extractor=lambda r: r.Status,
         )
-        glb_result = get_file_from_response(result.ResultFile3Ds, "glb")
-        obj_result = get_file_from_response(result.ResultFile3Ds, "obj")
-        file_glb = await download_url_to_file_3d(glb_result.Url, "glb", task_id=task_id) if glb_result else None
         return IO.NodeOutput(
-            file_glb, file_glb, await download_url_to_file_3d(obj_result.Url, "obj", task_id=task_id) if obj_result else None
+            f"{task_id}.glb",
+            await download_url_to_file_3d(
+                get_file_from_response(result.ResultFile3Ds, "glb").Url, "glb", task_id=task_id
+            ),
+            await download_url_to_file_3d(
+                get_file_from_response(result.ResultFile3Ds, "obj").Url, "obj", task_id=task_id
+            ),
         )
 
 
@@ -279,11 +289,105 @@ class TencentImageToModelNode(IO.ComfyNode):
             response_model=To3DProTaskResultResponse,
             status_extractor=lambda r: r.Status,
         )
-        glb_result = get_file_from_response(result.ResultFile3Ds, "glb")
-        obj_result = get_file_from_response(result.ResultFile3Ds, "obj")
-        file_glb = await download_url_to_file_3d(glb_result.Url, "glb", task_id=task_id) if glb_result else None
         return IO.NodeOutput(
-            file_glb, file_glb, await download_url_to_file_3d(obj_result.Url, "obj", task_id=task_id) if obj_result else None
+            f"{task_id}.glb",
+            await download_url_to_file_3d(
+                get_file_from_response(result.ResultFile3Ds, "glb").Url, "glb", task_id=task_id
+            ),
+            await download_url_to_file_3d(
+                get_file_from_response(result.ResultFile3Ds, "obj").Url, "obj", task_id=task_id
+            ),
+        )
+
+
+class TencentModelTo3DUVNode(IO.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="TencentModelTo3DUVNode",
+            display_name="Hunyuan3D: Model to UV",
+            category="api node/3d/Tencent",
+            description="Perform UV unfolding on a 3D model to generate UV texture. "
+            "Input model must have less than 30000 faces.",
+            inputs=[
+                IO.MultiType.Input(
+                    "model_3d",
+                    types=[IO.File3DGLB, IO.File3DOBJ, IO.File3DFBX, IO.File3DAny],
+                    tooltip="Input 3D model (GLB, OBJ, or FBX)",
+                ),
+                IO.Int.Input(
+                    "seed",
+                    default=1,
+                    min=0,
+                    max=2147483647,
+                    display_mode=IO.NumberDisplay.number,
+                    control_after_generate=True,
+                    tooltip="Seed controls whether the node should re-run; "
+                    "results are non-deterministic regardless of seed.",
+                ),
+            ],
+            outputs=[
+                IO.File3DOBJ.Output(display_name="OBJ"),
+                IO.File3DFBX.Output(display_name="FBX"),
+            ],
+            hidden=[
+                IO.Hidden.auth_token_comfy_org,
+                IO.Hidden.api_key_comfy_org,
+                IO.Hidden.unique_id,
+            ],
+            is_api_node=True,
+            price_badge=IO.PriceBadge(expr='{"type":"usd","usd":0.2}'),
+        )
+
+    SUPPORTED_FORMATS = {"glb", "obj", "fbx"}
+
+    @classmethod
+    async def execute(
+        cls,
+        model_3d: Types.File3D,
+        seed: int,
+    ) -> IO.NodeOutput:
+        _ = seed
+        file_format = model_3d.format.lower()
+        if file_format not in cls.SUPPORTED_FORMATS:
+            raise ValueError(
+                f"Unsupported file format: '{file_format}'. "
+                f"Supported formats: {', '.join(sorted(cls.SUPPORTED_FORMATS))}."
+            )
+        mime_types = {
+            "glb": "model/gltf-binary",
+            "obj": "model/obj",
+            "fbx": "application/octet-stream",
+        }
+        response = await sync_op(
+            cls,
+            ApiEndpoint(path="/proxy/tencent/hunyuan/3d-uv", method="POST"),
+            response_model=To3DProTaskCreateResponse,
+            data=To3DUVTaskRequest(
+                File=To3DUVFileInput(
+                    Type=file_format.upper(),
+                    Url=await upload_file_to_comfyapi(
+                        cls,
+                        model_3d.get_data(),
+                        f"model.{file_format}",
+                        mime_types.get(file_format, "application/octet-stream"),
+                    ),
+                )
+            ),
+        )
+        if response.Error:
+            raise ValueError(f"Task creation failed with code {response.Error.Code}: {response.Error.Message}")
+        result = await poll_op(
+            cls,
+            ApiEndpoint(path="/proxy/tencent/hunyuan/3d-uv/query", method="POST"),
+            data=To3DProTaskQueryRequest(JobId=response.JobId),
+            response_model=To3DProTaskResultResponse,
+            status_extractor=lambda r: r.Status,
+        )
+        return IO.NodeOutput(
+            await download_url_to_file_3d(get_file_from_response(result.ResultFile3Ds, "obj").Url, "obj"),
+            await download_url_to_file_3d(get_file_from_response(result.ResultFile3Ds, "fbx").Url, "fbx"),
         )
 
 
@@ -293,6 +397,7 @@ class TencentHunyuan3DExtension(ComfyExtension):
         return [
             TencentTextToModelNode,
             TencentImageToModelNode,
+            TencentModelTo3DUVNode,
         ]
 
 
