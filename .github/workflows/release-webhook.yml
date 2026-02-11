@@ -7,6 +7,8 @@ on:
 jobs:
   send-webhook:
     runs-on: ubuntu-latest
+    env:
+      DESKTOP_REPO_DISPATCH_TOKEN: ${{ secrets.DESKTOP_REPO_DISPATCH_TOKEN }}
     steps:
       - name: Send release webhook
         env:
@@ -108,9 +110,9 @@ jobs:
           echo "✅ Release webhook sent successfully"
 
       - name: Send repository dispatch to desktop
-        if: ${{ secrets.DESKTOP_REPO_DISPATCH_TOKEN != '' }}
+        if: ${{ env.DESKTOP_REPO_DISPATCH_TOKEN != '' }}
         env:
-          DISPATCH_TOKEN: ${{ secrets.DESKTOP_REPO_DISPATCH_TOKEN }}
+          DISPATCH_TOKEN: ${{ env.DESKTOP_REPO_DISPATCH_TOKEN }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_URL: ${{ github.event.release.html_url }}
         run: |
@@ -137,5 +139,5 @@ jobs:
           echo "✅ Dispatched ComfyUI release ${RELEASE_TAG} to Comfy-Org/desktop"
 
       - name: Warn when desktop dispatch is not configured
-        if: ${{ secrets.DESKTOP_REPO_DISPATCH_TOKEN == '' }}
+        if: ${{ env.DESKTOP_REPO_DISPATCH_TOKEN == '' }}
         run: echo "::warning::DESKTOP_REPO_DISPATCH_TOKEN is not set; skipping Comfy-Org/desktop repository_dispatch."
